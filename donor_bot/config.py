@@ -45,6 +45,10 @@ class Config:
     captcha_api_key: str
     captcha_solve_timeout_sec: int
     selectors: dict[str, list[str]]
+    archive_dir: Path
+    archive_keep_days: int
+    learned_dir: Path
+    use_learned: bool
     state_file: Path
     log_file: Path
     telegram_token: str
@@ -73,6 +77,8 @@ def load_config(path: str | Path = "config.yaml", env_path: str | Path = ".env")
     browser = data.get("browser", {})
     notify = data.get("notify", {})
     captcha = data.get("captcha", {})
+    archive = data.get("archive", {})
+    learning = data.get("learning", {})
 
     selectors: dict[str, list[str]] = {}
     for key, value in (data.get("selectors") or {}).items():
@@ -107,6 +113,10 @@ def load_config(path: str | Path = "config.yaml", env_path: str | Path = ".env")
         captcha_api_key=os.getenv("CAPTCHA_API_KEY") or str(captcha.get("api_key", "") or ""),
         captcha_solve_timeout_sec=int(captcha.get("solve_timeout_sec", 150)),
         selectors=selectors,
+        archive_dir=base_dir / archive.get("dir", "runs"),
+        archive_keep_days=int(archive.get("keep_days", 30)),
+        learned_dir=base_dir / learning.get("dir", "learned"),
+        use_learned=bool(learning.get("enabled", True)),
         state_file=base_dir / data.get("state_file", "state.json"),
         log_file=base_dir / data.get("log_file", "bot.log"),
         telegram_token=os.getenv("TELEGRAM_BOT_TOKEN") or notify.get("telegram_bot_token", "") or "",

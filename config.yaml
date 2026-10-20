@@ -53,5 +53,18 @@ selectors: {}
 #  success: [".alert-success"]
 #  has_booking: [".my-record"]
 
+# Архив прогонов: скриншоты, HTML и список элементов каждого шага, журнал нажатий
+# с селекторами (trace_NN.json), история результатов (runs/history.jsonl).
+archive:
+  dir: runs
+  keep_days: 30            # старше — удаляются; 0 = хранить всё
+
+# После успешного прохождения формы бот сохраняет селекторы нажатых элементов в
+# learned/<сайт>.json и в следующих запусках пробует их первыми (быстрее и надёжнее
+# эвристик). Если селектор не находит элемент — работает обычный автопоиск.
+learning:
+  enabled: true
+  dir: learned
+
 state_file: state.json
 log_file: bot.log

@@ -2,6 +2,7 @@
 state.json
 bot.log
 recon_out/
+runs/
 __pycache__/
 *.pyc
 .venv/

@@ -17,6 +17,10 @@ from pathlib import Path
 
 from playwright.sync_api import BrowserContext, Error as PWError, Page, TimeoutError as PWTimeout
 
+import hashlib
+from datetime import datetime
+
+from .archive import Learned, RunArchive
 from .captcha import CaptchaSolver, CaptchaStatus
 from .config import Config, Site
 
@@ -52,6 +56,7 @@ RX = {
     "no_slots": re.compile(r"нет (свободн|доступн)|мест нет|запись недоступн|свободных мест нет|временно недоступн", re.I),
     "login_error": re.compile(r"неверн|неправильн|ошибк|не найден|заблокир|блокир", re.I),
     "consent": re.compile(r"соглас|ознаком|правил|подтвержда", re.I),
+    "day_num": re.compile(r"^\s*\d{1,2}\s*$"),
     "time_text": re.compile(r"^\s*(\d{1,2})[:.](\d{2})\s*(?:[-–—]\s*\d{1,2}[:.]\d{2})?\s*$"),
     "date_text": re.compile(
         r"^\s*(?:(?:пн|вт|ср|чт|пт|сб|вс|понедельник|вторник|среда|четверг|пятница|суббота|воскресенье)[,.]?\s*)?"
@@ -86,6 +91,40 @@ COLLECT_JS = r"""
     const cls = (typeof el.className === 'string' ? el.className : '').toLowerCase();
     info.push({el, text, cls, noPointer: st.pointerEvents === 'none'});
   }
+  const cssEsc = v => (window.CSS && CSS.escape) ? CSS.escape(v) : String(v).replace(/([^\w-])/g, '\\$1');
+  const STATE_RX = /^(active|selected|checked|current|chosen|disabled|inactive|hover|focus|open|show|hidden|visible|busy|past|unavailable|today)$/i;
+  const part = (el, withIndex) => {
+    if (el.id && !/\d{3,}/.test(el.id)) return '#' + cssEsc(el.id);
+    let p = el.tagName.toLowerCase();
+    const name = el.getAttribute('name');
+    if (name) p += '[name="' + name + '"]';
+    const type = el.getAttribute('type');
+    if (el.tagName === 'INPUT' && type) p += '[type="' + type + '"]';
+    const classes = Array.from(el.classList).filter(c => !STATE_RX.test(c) && !/\d{3,}/.test(c)).slice(0, 3);
+    if (classes.length) p += '.' + classes.map(cssEsc).join('.');
+    if (withIndex && el.parentElement) {
+      const sib = Array.from(el.parentElement.children).filter(c => c.tagName === el.tagName);
+      if (sib.length > 1) p += ':nth-of-type(' + (sib.indexOf(el) + 1) + ')';
+    }
+    return p;
+  };
+  const build = (el, general) => {
+    // general=true: без порядковых индексов — селектор на весь список (все дни, все слоты)
+    let cur = el, parts = [], depth = 0;
+    while (cur && cur.nodeType === 1 && cur !== document.body && depth < 6) {
+      const p = part(cur, !general);
+      parts.unshift(p);
+      const sel = parts.join(' > ');
+      if (p.startsWith('#')) return sel;
+      try {
+        const n = document.querySelectorAll(sel).length;
+        if (!general && n === 1) return sel;
+        if (general && n >= 1 && n <= 60 && (depth >= 1 || /[.#\[]/.test(p))) return sel;
+      } catch (e) {}
+      cur = cur.parentElement; depth++;
+    }
+    return parts.join(' > ');
+  };
   const out = [];
   let i = 0;
   for (const it of info) {
@@ -99,10 +138,12 @@ COLLECT_JS = r"""
       el.getAttribute('aria-checked') === 'true' ||
       /(^|[\s_-])(active|selected|checked|current|chosen)([\s_-]|$)/.test(it.cls);
     el.setAttribute('data-dbot-idx', String(i));
+    const inCal = !!el.closest('[class*=calendar i], [class*=datepicker i], [class*=picker i], table');
     out.push({idx: i, tag: el.tagName.toLowerCase(), type: (el.getAttribute('type') || '').toLowerCase(),
               text: it.text.slice(0, 200), cls: it.cls.slice(0, 200), disabled, selected,
               href: el.getAttribute('href') || '', name: el.getAttribute('name') || '',
-              value: (el.getAttribute('value') || '').slice(0, 100)});
+              value: (el.getAttribute('value') || '').slice(0, 100),
+              sel: build(el, false), gsel: build(el, true), inCal});
     i++;
   }
   return out;
@@ -133,6 +174,10 @@ class Element:
     href: str = ""
     name: str = ""
     value: str = ""
+    sel: str = ""
+    gsel: str = ""
+    inCal: bool = False
+    source: str = "heuristic"   # heuristic | custom | learned — как элемент был найден
 
     @property
     def is_input_like(self) -> bool:
@@ -140,14 +185,23 @@ class Element:
 
 
 class SiteClient:
-    def __init__(self, cfg: Config, site: Site, context: BrowserContext, dump_dir: Path | None = None):
+    def __init__(self, cfg: Config, site: Site, context: BrowserContext, archive: RunArchive | None = None):
         self.cfg = cfg
         self.site = site
         self.context = context
         self.page: Page = context.new_page()
         self.page.set_default_timeout(cfg.timeout_ms)
-        self.dump_dir = dump_dir
+        self.archive = archive
+        self.dump_dir = archive.site_dir(site.name) if archive else None
         self.dump_counter = 0
+        self._last_dump_hash: dict[str, str] = {}
+        self.learned = Learned(cfg.learned_dir / f"{site.name}.json") if cfg.use_learned else None
+        if self.learned and self.learned.data:
+            log.info("[%s] использую рецепт из %s (%s)", site.name, self.learned.path,
+                     self.learned.data.get("saved_at", ""))
+        self.trace: list[dict] = []
+        self.attempt_no = 0
+        self._last_custom: tuple[str, str, str] | None = None
         self.type_rx = re.compile(cfg.donation_type_regex, re.I)
         self.last_message = ""
         self.captcha = CaptchaSolver(cfg, site.name)
@@ -183,8 +237,18 @@ class SiteClient:
     def loc(self, el: Element):
         return self.page.locator(f'[data-dbot-idx="{el.idx}"]').first
 
-    def click(self, el: Element, why: str) -> None:
-        log.info("[%s] клик: %s <%s> «%s»", self.site.name, why, el.tag, el.text[:60])
+    def record(self, role: str, el: Element | None = None, selector: str = "", source: str | None = None) -> None:
+        entry = {"time": datetime.now().isoformat(timespec="milliseconds"), "role": role,
+                 "source": source or (el.source if el is not None else "heuristic"), "url": self.page.url}
+        if el is not None:
+            entry.update({"tag": el.tag, "text": el.text[:120], "cls": el.cls[:120], "sel": el.sel, "gsel": el.gsel})
+        if selector:
+            entry["sel"] = selector
+        self.trace.append(entry)
+
+    def click(self, el: Element, why: str, role: str = "") -> None:
+        log.info("[%s] клик: %s <%s> «%s»  [%s]", self.site.name, why, el.tag, el.text[:60], el.sel)
+        self.record(role or why, el)
         target = self.loc(el)
         try:
             target.scroll_into_view_if_needed(timeout=2000)
@@ -200,17 +264,22 @@ class SiteClient:
         """Сохраняет скриншот, HTML и список элементов (режим разведки)."""
         if not self.dump_dir:
             return
+        try:
+            html = self.page.content()
+        except PWError:
+            return
+        digest = hashlib.sha1(html.encode("utf-8", "ignore")).hexdigest()
+        if self._last_dump_hash.get(label) == digest:
+            return  # страница не изменилась с прошлого дампа этого шага — не засоряем архив
+        self._last_dump_hash[label] = digest
         self.dump_counter += 1
         base = self.dump_dir / f"{self.dump_counter:02d}_{label}"
         self.dump_dir.mkdir(parents=True, exist_ok=True)
+        base.with_suffix(".html").write_text(html, encoding="utf-8")
         try:
             self.page.screenshot(path=str(base) + ".png", full_page=True)
         except PWError as exc:
             log.debug("screenshot failed: %s", exc)
-        try:
-            (base.with_suffix(".html")).write_text(self.page.content(), encoding="utf-8")
-        except PWError as exc:
-            log.debug("content failed: %s", exc)
         try:
             els = [e.__dict__ for e in self.collect()]
             selects = self.page.evaluate(SELECTS_JS)
@@ -221,13 +290,33 @@ class SiteClient:
             log.debug("elements dump failed: %s", exc)
         log.info("[%s] дамп сохранён: %s.*", self.site.name, base)
 
+    ROLE_RX = {"book_button": "book", "confirm": "confirm", "login_submit": "login_submit"}
+
+    def _role_text_ok(self, key: str, text: str) -> bool:
+        if key == "donation_type":
+            return bool(self.type_rx.search(text))
+        rx = self.ROLE_RX.get(key)
+        if rx is None:
+            return True
+        return bool(RX[rx].search(text)) and not RX["cancel"].search(text)
+
     def custom(self, key: str):
-        """Локатор по пользовательскому селектору из config.yaml, если задан и виден."""
-        for css in self.cfg.selectors.get(key, []):
+        """Локатор по селектору из config.yaml (приоритет) или из выученного рецепта."""
+        sources = [("custom", css) for css in self.cfg.selectors.get(key, [])]
+        if self.learned:
+            sources += [("learned", css) for css in self.learned.selectors(key)]
+        for source, css in sources:
             try:
                 l = self.page.locator(css).first
-                if l.count() and l.is_visible():
-                    return l
+                if not l.count() or not l.is_visible():
+                    continue
+                if source == "learned":
+                    text = (l.inner_text(timeout=500) or l.get_attribute("value") or "").strip()
+                    if not self._role_text_ok(key, text):
+                        log.debug("[%s] learned %s=%s: текст «%s» не подходит", self.site.name, key, css, text)
+                        continue
+                self._last_custom = (key, css, source)
+                return l
             except PWError:
                 continue
         return None
@@ -272,7 +361,7 @@ class SiteClient:
             # Возможно, нужна кнопка «Войти», чтобы показать форму
             for el in self.collect():
                 if RX["login_link"].search(el.text) and not el.disabled and el.is_input_like:
-                    self.click(el, "ссылка входа")
+                    self.click(el, "ссылка входа", role="login_link")
                     break
         if not self.password_visible():
             if self.is_logged_in():
@@ -374,6 +463,7 @@ class SiteClient:
                 l.evaluate("e => e.setAttribute('data-dbot-custom', '1')")
                 for el in els:
                     if self.page.locator(f'[data-dbot-idx="{el.idx}"][data-dbot-custom="1"]').count():
+                        el.source = self._last_custom[2] if self._last_custom else "custom"
                         return [el]
             except PWError:
                 pass
@@ -440,7 +530,7 @@ class SiteClient:
         changed = False
         for e in els:
             if e.tag == "input" and e.type == "checkbox" and not e.selected and not e.disabled:
-                self.click(e, "чекбокс согласия")
+                self.click(e, "чекбокс согласия", role="consent")
                 changed = True
         return changed
 
@@ -457,12 +547,29 @@ class SiteClient:
     def attempt(self) -> Result:
         """Одна попытка записи. Возвращает Result."""
         self.last_message = ""
+        self.trace = []
+        self.attempt_no += 1
         try:
-            return self._attempt()
+            result = self._attempt()
         except PWError as exc:
             log.warning("[%s] ошибка браузера: %s", self.site.name, str(exc).splitlines()[0])
             self.dump("error")
-            return Result.ERROR
+            result = Result.ERROR
+        self._finish_attempt(result)
+        return result
+
+    def _finish_attempt(self, result: Result) -> None:
+        if self.archive:
+            self.archive.record(self.site.name, result.value, self.last_message)
+            if self.trace:
+                path = self.dump_dir / f"trace_{self.attempt_no:02d}.json"
+                path.write_text(json.dumps({
+                    "site": self.site.name, "result": result.value, "message": self.last_message,
+                    "finished": datetime.now().isoformat(timespec="seconds"), "steps": self.trace,
+                }, ensure_ascii=False, indent=1), encoding="utf-8")
+                log.info("[%s] журнал действий: %s", self.site.name, path)
+        if self.learned is not None and result in (Result.BOOKED, Result.DRY_RUN) and self.trace:
+            self.learned.save(Learned.from_trace(self.site.name, self.trace, result.value, self.account_url))
 
     def _attempt(self) -> Result:
         if not self.ensure_logged_in():
@@ -482,7 +589,7 @@ class SiteClient:
             log.info("[%s] кнопок записи нет (всего кликабельных элементов: %d)", self.site.name, len(els))
             return Result.NO_BUTTON
 
-        self.click(buttons[0], "кнопка записи")
+        self.click(buttons[0], "кнопка записи", role="book_button")
         return self._walk_form()
 
     def _walk_form(self, max_steps: int = 10) -> Result:
@@ -511,6 +618,8 @@ class SiteClient:
             if not clicked_type:
                 c = self.custom("donation_type")
                 if c is not None:
+                    self.record("donation_type", selector=self._last_custom[1], source=self._last_custom[2])
+                    log.info("[%s] клик: вид донации (%s: %s)", self.site.name, *self._last_custom[2:0:-1])
                     c.click()
                     self._settle()
                     clicked_type = True
@@ -519,22 +628,24 @@ class SiteClient:
                          if self.type_rx.search(e.text) and not e.disabled and not e.selected
                          and len(e.text) <= (40 if e.tag in ("li", "td", "label") else 80)]
                 if typed:
-                    self.click(typed[0], "вид донации")
+                    self.click(typed[0], "вид донации", role="donation_type")
                     clicked_type = True
                     continue
 
             # 2. Дата
             dates = self._custom_list("date") or [
-                e for e in els if RX["date_text"].match(e.text) and not e.disabled and len(e.text) <= 30]
+                e for e in els if not e.disabled and len(e.text) <= 30 and (
+                    RX["date_text"].match(e.text)
+                    or (RX["day_num"].match(e.text) and (e.inCal or "day" in e.cls or "date" in e.cls)))]
             if dates and not any(e.selected for e in dates):
-                self.click(self._pick_date(dates), "дата")
+                self.click(self._pick_date(dates), "дата", role="date")
                 continue
 
             # 3. Время
             times = self._custom_list("time") or [
                 e for e in els if RX["time_text"].match(e.text) and not e.disabled and len(e.text) <= 20]
             if times and not any(e.selected for e in times):
-                self.click(self._pick_time(times), "время")
+                self.click(self._pick_time(times), "время", role="time")
                 continue
 
             # 4. Подтверждение / далее
@@ -558,14 +669,21 @@ class SiteClient:
                 is_final = bool(RX["final_confirm"].search(text)) or len(self.cfg.selectors.get("confirm", [])) > 0 and text == "custom confirm"
                 if self.cfg.dry_run and is_final:
                     log.info("[%s] DRY RUN: остановился перед кнопкой «%s»", self.site.name, text)
+                    if confirm_el is not None:
+                        self.record("confirm", confirm_el)
+                    else:
+                        self.record("confirm", selector=self._last_custom[1], source=self._last_custom[2])
+                    self.trace[-1]["clicked"] = False
                     self.dump("dry_run_stop")
                     return Result.DRY_RUN
                 if confirm is not None:
-                    log.info("[%s] клик: подтверждение (custom selector)", self.site.name)
+                    self.record("confirm", selector=self._last_custom[1], source=self._last_custom[2])
+                    log.info("[%s] клик: подтверждение «%s» (%s: %s)", self.site.name, text,
+                             self._last_custom[2], self._last_custom[1])
                     confirm.click()
                     self._settle(1000)
                 else:
-                    self.click(confirm_el, "подтверждение")
+                    self.click(confirm_el, "подтверждение", role="confirm")
                     self._settle(400)
                 if is_final:
                     self._settle(500)
@@ -588,17 +706,22 @@ class SiteClient:
 
     def _custom_list(self, key: str) -> list[Element]:
         """Элементы, подходящие под пользовательский селектор (date/time)."""
-        if key not in self.cfg.selectors:
+        css_list = [(css, "custom") for css in self.cfg.selectors.get(key, [])]
+        if self.learned:
+            css_list += [(css, "learned") for css in self.learned.selectors(key)]
+        if not css_list:
             return []
-        out: list[Element] = []
-        for css in self.cfg.selectors[key]:
+        for css, source in css_list:
             try:
                 self.page.locator(css).evaluate_all(
-                    f"els => els.forEach(e => e.setAttribute('data-dbot-{key}', '1'))")
+                    f"els => els.forEach(e => e.setAttribute('data-dbot-{key}', '{source}'))")
             except PWError:
                 continue
+        out: list[Element] = []
         for e in self.collect():
-            if self.page.locator(f'[data-dbot-idx="{e.idx}"][data-dbot-{key}="1"]').count() and not e.disabled:
+            marked = self.page.locator(f'[data-dbot-idx="{e.idx}"][data-dbot-{key}]')
+            if marked.count() and not e.disabled:
+                e.source = marked.first.get_attribute(f"data-dbot-{key}") or "custom"
                 out.append(e)
         return out
 

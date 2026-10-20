@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from playwright.sync_api import sync_playwright
 
+from .archive import RunArchive
 from .config import Config
 from .notify import notify
 from .site import Result, SiteClient
@@ -92,7 +93,8 @@ class BrowserSession:
 
 
 def run_window(cfg: Config, state: State, window_min: float | None = None,
-               dump_root: Path | None = None, sites: list[str] | None = None) -> Result | None:
+               mode: str = "run", sites: list[str] | None = None,
+               archive_root: Path | None = None) -> Result | None:
     """Пытается записаться на сайтах по приоритету, пока не выйдет окно или не будет успеха."""
     window_min = cfg.window_min if window_min is None else window_min
     tz = ZoneInfo(cfg.timezone)
@@ -105,6 +107,8 @@ def run_window(cfg: Config, state: State, window_min: float | None = None,
     chosen = [s for s in cfg.sites if not sites or s.name in sites]
 
     final: Result | None = None
+    archive = RunArchive(archive_root or cfg.archive_dir, mode, cfg.archive_keep_days)
+    log.info("архив прогона: %s", archive.dir)
     with sync_playwright() as pw:
         session = BrowserSession(pw, cfg)
         clients: dict[str, SiteClient] = {}
@@ -112,8 +116,7 @@ def run_window(cfg: Config, state: State, window_min: float | None = None,
         def client_for(site) -> SiteClient:
             c = clients.get(site.name)
             if c is None:
-                c = SiteClient(cfg, site, session.new_context(),
-                               dump_dir=(dump_root / site.name) if dump_root else None)
+                c = SiteClient(cfg, site, session.new_context(), archive=archive)
                 clients[site.name] = c
             return c
 

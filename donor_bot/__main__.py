@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     recon = sub.add_parser("recon", help="разведка: войти, сохранить скриншоты/HTML всех шагов, ничего не подтверждать")
     recon.add_argument("--site", action="append", help="ограничить сайтами (по name из config)")
-    recon.add_argument("--out", default="recon_out", help="папка для дампов")
+    recon.add_argument("--out", default=None, help="папка для дампов (по умолчанию archive.dir из config)")
 
     sub.add_parser("login-test", help="проверить вход на все сайты")
     sub.add_parser("next", help="показать время следующего запуска")
@@ -83,19 +83,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "recon":
         cfg.dry_run = True
-        out = Path(args.out) / datetime.now().strftime("%Y%m%d_%H%M%S")
-        out.mkdir(parents=True, exist_ok=True)
-        log.info("разведка: дампы в %s", out.resolve())
-        result = run_window(cfg, state, window_min=0, dump_root=out, sites=args.site)
+        root = Path(args.out) if args.out else cfg.archive_dir
+        result = run_window(cfg, state, window_min=0, mode="recon", sites=args.site, archive_root=root)
         print(f"\nРезультат разведки: {result.value if result else 'ничего не записано'}")
-        print(f"Скриншоты, HTML и списки элементов: {out.resolve()}")
+        print(f"Скриншоты, HTML, списки элементов и журнал действий: {root.resolve()} (последняя папка *_recon)")
         return 0
 
     if args.cmd == "once":
         if args.dry_run:
             cfg.dry_run = True
         window = 0.5 if args.window is None else args.window
-        result = run_window(cfg, state, window_min=window, sites=args.site)
+        result = run_window(cfg, state, window_min=window, mode="once", sites=args.site)
         print(f"Результат: {result.value if result else 'не записались'}")
         return 0 if result else 1
 
