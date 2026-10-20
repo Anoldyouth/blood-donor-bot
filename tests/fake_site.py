@@ -22,6 +22,9 @@ class FakeState:
         self.booking: dict | None = None
         self.sessions: set[str] = set()
         self.confirm_count = 0
+        self.captcha = "off"          # off | checkbox | challenge
+        self.last_token = ""
+        self.solver_calls = 0
 
 
 STATE = FakeState()
@@ -40,6 +43,36 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+
+    def _raw(self, body: str, status=HTTPStatus.OK, ctype="text/html; charset=utf-8"):
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _captcha_html(self) -> str:
+        if STATE.captcha == "off":
+            return ""
+        mode = "1" if STATE.captcha == "checkbox" else "2"
+        return f"""
+            <div class="smart-captcha" data-sitekey="ysc1_fake_sitekey">
+              <iframe src="/captcha/checkbox?m={mode}" width="300" height="60"></iframe>
+            </div>
+            <input type="hidden" name="smart-token" value="">
+            <script>
+            window.addEventListener('message', (e) => {{
+              if (e.data && e.data.type === 'smart-token') {{
+                document.querySelector('input[name=smart-token]').value = e.data.token;
+              }}
+              if (e.data && e.data.type === 'smart-challenge') {{
+                const f = document.createElement('iframe');
+                f.src = '/captcha/advanced'; f.width = 400; f.height = 300;
+                document.querySelector('.smart-captcha').appendChild(f);
+              }}
+            }});
+            </script>"""
 
     def _redirect(self, to: str, headers: dict | None = None):
         self.send_response(HTTPStatus.FOUND)
@@ -69,7 +102,36 @@ class Handler(BaseHTTPRequestHandler):
             STATE.booking = None
             STATE.slots_open = True
             STATE.confirm_count = 0
+            STATE.captcha = "off"
+            STATE.last_token = ""
+            STATE.solver_calls = 0
             return self._send("ok")
+        if path == "/admin/captcha":
+            STATE.captcha = q.get("v", "off")
+            return self._send("ok")
+
+        # --- имитация Яндекс SmartCaptcha: iframe с чекбоксом и «заданием»
+        if path == "/captcha/checkbox":
+            mode = q.get("m", "1")
+            return self._raw(f"""<!doctype html><html><body>
+                <button id="js-button" role="checkbox" aria-checked="false">Я не робот</button>
+                <script>
+                document.getElementById('js-button').onclick = () => {{
+                  if ({'true' if mode == '1' else 'false'}) {{
+                    document.getElementById('js-button').setAttribute('aria-checked', 'true');
+                    parent.postMessage({{type: 'smart-token', token: 'tok-checkbox'}}, '*');
+                  }} else {{
+                    parent.postMessage({{type: 'smart-challenge'}}, '*');
+                  }}
+                }};
+                </script></body></html>""")
+        if path == "/captcha/advanced":
+            return self._raw("<!doctype html><html><body><div class='AdvancedCaptcha'>"
+                             "Выберите все картинки с светофорами</div></body></html>")
+        # --- имитация API rucaptcha/2captcha
+        if path == "/res.php":
+            STATE.solver_calls += 1
+            return self._raw('{"status":1,"request":"tok-service"}', ctype="application/json")
 
         if path in ("/", "/account"):
             if not self._logged_in():
@@ -78,6 +140,7 @@ class Handler(BaseHTTPRequestHandler):
                 <form method="post" action="/login">
                   <label>Email или номер донора <input name="login" type="text"></label>
                   <label>Пароль <input name="password" type="password"></label>
+                  """ + self._captcha_html() + """
                   <button type="submit" class="btn">Войти</button>
                 </form><a href="/forgot-pass/">Сброс пароля</a></div>""")
             if STATE.booking:
@@ -144,9 +207,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path.rstrip("/")
         form = self._form()
+        if path == "/in.php":
+            STATE.solver_calls += 1
+            return self._raw('{"status":1,"request":"42"}', ctype="application/json")
         if path == "/login":
-            if form.get("login") == LOGIN and form.get("password") == PASSWORD:
-                return self._redirect("/account/", {"Set-Cookie": "sid=ok; Path=/"})
+            STATE.last_token = form.get("smart-token", "")
+            captcha_ok = STATE.captcha == "off" or STATE.last_token in ("tok-checkbox", "tok-service")
+            if form.get("login") == LOGIN and form.get("password") == PASSWORD and captcha_ok:
+                return self._redirect("/account/", {"Set-Cookie": "sid=ok; Path=/; Max-Age=86400"})
             return self._send("""<div class="alert">Неверный логин или пароль</div>
                 <form method="post" action="/login"><input name="login" type="text">
                 <input name="password" type="password"><button type="submit">Войти</button></form>""")

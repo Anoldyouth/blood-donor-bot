@@ -25,10 +25,19 @@ booking:
   pause_days_after_success: 14       # после успешной записи не пытаться записаться столько дней
 
 browser:
-  headless: true
+  headless: false          # видимый браузер реже получает задание капчи от Яндекса
   slow_mo_ms: 0
   timeout_ms: 10000
+  profile_dir: browser_profile   # постоянный профиль (cookies) — капча «запоминает» браузер
   # channel: chrome        # раскомментируйте, чтобы использовать установленный Google Chrome
+
+# Яндекс SmartCaptcha. Чекбокс «Я не робот» бот кликает сам. Если Яндекс показывает
+# задание (картинки/слайдер), его решает сервис распознавания по API-ключу из .env
+# (CAPTCHA_API_KEY). Поддерживаются rucaptcha и 2captcha (один и тот же API).
+captcha:
+  solver: rucaptcha        # rucaptcha | 2captcha
+  solver_url: ""           # свой URL API, если нужен (по умолчанию по solver)
+  solve_timeout_sec: 150   # сколько ждать ответа сервиса
 
 # Переопределение CSS-селекторов, если автопоиск не справился
 # (значения — список CSS-селекторов, проверяются по порядку).

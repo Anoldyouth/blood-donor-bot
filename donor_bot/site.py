@@ -17,6 +17,7 @@ from pathlib import Path
 
 from playwright.sync_api import BrowserContext, Error as PWError, Page, TimeoutError as PWTimeout
 
+from .captcha import CaptchaSolver, CaptchaStatus
 from .config import Config, Site
 
 log = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ class Result(str, Enum):
     NO_SLOTS = "no_slots"              # кнопка есть, но свободных дат/времени нет
     DRY_RUN = "dry_run"                # дошли до подтверждения, но не нажимали (dry_run)
     LOGIN_FAILED = "login_failed"
+    CAPTCHA_FAILED = "captcha_failed"  # капча не прошла автоматически
     STUCK = "stuck"                    # не поняли, что нажимать дальше
     ERROR = "error"
 
@@ -148,6 +150,8 @@ class SiteClient:
         self.dump_counter = 0
         self.type_rx = re.compile(cfg.donation_type_regex, re.I)
         self.last_message = ""
+        self.captcha = CaptchaSolver(cfg, site.name)
+        self.login_failed_reason = Result.LOGIN_FAILED
 
     # ------------------------------------------------------------------ utils
     @property
@@ -228,6 +232,18 @@ class SiteClient:
                 continue
         return None
 
+    # ---------------------------------------------------------------- captcha
+    def pass_captcha(self) -> bool:
+        """Если на странице капча — решает её автоматически. False = не удалось."""
+        status = self.captcha.solve(self.page)
+        if status == CaptchaStatus.FAILED:
+            self.last_message = "капча не решена автоматически"
+            self.dump("captcha_failed")
+            return False
+        if status == CaptchaStatus.SOLVED:
+            self._settle(300)
+        return True
+
     # ------------------------------------------------------------------ login
     def password_visible(self) -> bool:
         try:
@@ -246,6 +262,7 @@ class SiteClient:
         return bool(RX["book"].search(text) or RX["has_booking"].search(text))
 
     def login(self) -> bool:
+        self.login_failed_reason = Result.LOGIN_FAILED
         log.info("[%s] открываю %s", self.site.name, self.account_url)
         self.page.goto(self.account_url, wait_until="domcontentloaded")
         self._settle()
@@ -287,6 +304,9 @@ class SiteClient:
         login_input.fill(self.cfg.login)
         pwd.fill(self.cfg.password)
         self.dump("login_filled")
+        if not self.pass_captcha():
+            self.login_failed_reason = Result.CAPTCHA_FAILED
+            return False
 
         submit = self.custom("login_submit")
         if submit is None:
@@ -307,6 +327,17 @@ class SiteClient:
         self._settle(1000)
         self.dump("after_login")
 
+        if self.password_visible() and self.captcha.present(self.page) and not self.captcha.detect(self.page)["token"]:
+            # Капча появилась только после отправки формы — решаем и отправляем ещё раз
+            log.info("[%s] после отправки формы входа появилась капча", self.site.name)
+            if not self.pass_captcha():
+                self.login_failed_reason = Result.CAPTCHA_FAILED
+                return False
+            if self.page.locator("input[type=password]").first.input_value() == "":
+                self.page.locator("input[type=password]").first.fill(self.cfg.password)
+            (submit.click() if submit is not None else pwd.press("Enter"))
+            self._settle(1000)
+            self.dump("after_login_retry")
         if self.password_visible():
             text = self.body_text()
             m = RX["login_error"].search(text)
@@ -435,7 +466,7 @@ class SiteClient:
 
     def _attempt(self) -> Result:
         if not self.ensure_logged_in():
-            return Result.LOGIN_FAILED
+            return self.login_failed_reason
         self.page.goto(self.account_url, wait_until="domcontentloaded")
         self._settle()
         self.dump("account")
@@ -459,6 +490,8 @@ class SiteClient:
         clicked_type = False
         for step in range(1, max_steps + 1):
             self.dump(f"form_step{step}")
+            if not self.pass_captcha():
+                return Result.CAPTCHA_FAILED
             msg = self._check_messages()
             if msg == Result.BOOKED:
                 log.info("[%s] похоже, запись создана: %s", self.site.name, self.last_message)

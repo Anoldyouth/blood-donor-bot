@@ -65,19 +65,20 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "login-test":
         from playwright.sync_api import sync_playwright
-        from .scheduler import launch_browser, new_context
+        from .scheduler import BrowserSession
         from .site import SiteClient
 
         ok_all = True
         with sync_playwright() as pw:
-            browser = launch_browser(pw, cfg)
+            session = BrowserSession(pw, cfg)
             for site in cfg.sites:
-                client = SiteClient(cfg, site, new_context(browser))
+                client = SiteClient(cfg, site, session.new_context())
                 ok = client.login()
                 print(f"{site.name:12s} {site.url:32s} {'OK' if ok else 'FAIL'}")
                 ok_all &= ok
-                client.context.close()
-            browser.close()
+                client.close()
+                session.drop_context(client.context)
+            session.close()
         return 0 if ok_all else 1
 
     if args.cmd == "recon":

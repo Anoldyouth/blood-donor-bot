@@ -35,21 +35,60 @@ def next_window_start(cfg: Config, now: datetime | None = None) -> datetime:
     return start
 
 
-def launch_browser(pw, cfg: Config):
-    kwargs = {"headless": cfg.headless, "slow_mo": cfg.slow_mo_ms}
-    if cfg.channel:
-        kwargs["channel"] = cfg.channel
-    return pw.chromium.launch(**kwargs)
+STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+window.chrome = window.chrome || { runtime: {} };
+"""
+
+CONTEXT_ARGS = dict(
+    locale="ru-RU",
+    timezone_id="Europe/Moscow",
+    viewport={"width": 1280, "height": 900},
+    user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
+)
 
 
-def new_context(browser):
-    return browser.new_context(
-        locale="ru-RU",
-        timezone_id="Europe/Moscow",
-        viewport={"width": 1280, "height": 900},
-        user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
-    )
+class BrowserSession:
+    """Браузер на время окна. С profile_dir — один постоянный контекст (cookies сохраняются
+    между запусками, что снижает частоту заданий капчи); иначе — отдельный контекст на сайт."""
+
+    def __init__(self, pw, cfg: Config):
+        self.cfg = cfg
+        self.browser = None
+        self.shared = None
+        kwargs = {"headless": cfg.headless, "slow_mo": cfg.slow_mo_ms,
+                  "ignore_default_args": ["--enable-automation"]}
+        if cfg.channel:
+            kwargs["channel"] = cfg.channel
+        if cfg.profile_dir:
+            cfg.profile_dir.mkdir(parents=True, exist_ok=True)
+            self.shared = pw.chromium.launch_persistent_context(str(cfg.profile_dir), **kwargs, **CONTEXT_ARGS)
+            self.shared.add_init_script(STEALTH_JS)
+        else:
+            self.browser = pw.chromium.launch(**kwargs)
+
+    def new_context(self):
+        if self.shared is not None:
+            return self.shared
+        ctx = self.browser.new_context(**CONTEXT_ARGS)
+        ctx.add_init_script(STEALTH_JS)
+        return ctx
+
+    def drop_context(self, ctx) -> None:
+        if ctx is not self.shared:
+            try:
+                ctx.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def close(self) -> None:
+        for obj in (self.shared, self.browser):
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 def run_window(cfg: Config, state: State, window_min: float | None = None,
@@ -67,13 +106,13 @@ def run_window(cfg: Config, state: State, window_min: float | None = None,
 
     final: Result | None = None
     with sync_playwright() as pw:
-        browser = launch_browser(pw, cfg)
+        session = BrowserSession(pw, cfg)
         clients: dict[str, SiteClient] = {}
 
         def client_for(site) -> SiteClient:
             c = clients.get(site.name)
             if c is None:
-                c = SiteClient(cfg, site, new_context(browser),
+                c = SiteClient(cfg, site, session.new_context(),
                                dump_dir=(dump_root / site.name) if dump_root else None)
                 clients[site.name] = c
             return c
@@ -104,11 +143,9 @@ def run_window(cfg: Config, state: State, window_min: float | None = None,
                         _on_stop(cfg, state, site.name, result, client.last_message)
                         return final
                     if result == Result.ERROR:
-                        # Пересоздаём контекст, если браузер «сломался»
-                        try:
-                            client.context.close()
-                        except Exception:  # noqa: BLE001
-                            pass
+                        # Пересоздаём страницу/контекст, если браузер «сломался»
+                        client.close()
+                        session.drop_context(client.context)
                         clients.pop(site.name, None)
                 if datetime.now(tz) >= deadline:
                     log.info("окно попыток закончилось, записаться не удалось")
@@ -116,11 +153,9 @@ def run_window(cfg: Config, state: State, window_min: float | None = None,
                 time.sleep(cfg.retry_interval_sec)
         finally:
             for c in clients.values():
-                try:
-                    c.context.close()
-                except Exception:  # noqa: BLE001
-                    pass
-            browser.close()
+                c.close()
+                session.drop_context(c.context)
+            session.close()
 
 
 def _on_stop(cfg: Config, state: State, site_name: str, result: Result, message: str) -> None:

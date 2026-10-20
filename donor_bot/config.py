@@ -39,6 +39,11 @@ class Config:
     slow_mo_ms: int
     timeout_ms: int
     channel: str | None
+    profile_dir: Path | None
+    captcha_solver: str
+    captcha_solver_url: str
+    captcha_api_key: str
+    captcha_solve_timeout_sec: int
     selectors: dict[str, list[str]]
     state_file: Path
     log_file: Path
@@ -67,6 +72,7 @@ def load_config(path: str | Path = "config.yaml", env_path: str | Path = ".env")
     booking = data.get("booking", {})
     browser = data.get("browser", {})
     notify = data.get("notify", {})
+    captcha = data.get("captcha", {})
 
     selectors: dict[str, list[str]] = {}
     for key, value in (data.get("selectors") or {}).items():
@@ -95,6 +101,11 @@ def load_config(path: str | Path = "config.yaml", env_path: str | Path = ".env")
         slow_mo_ms=int(browser.get("slow_mo_ms", 0)),
         timeout_ms=int(browser.get("timeout_ms", 10000)),
         channel=browser.get("channel"),
+        profile_dir=(base_dir / browser["profile_dir"]) if browser.get("profile_dir") else None,
+        captcha_solver=str(captcha.get("solver", "") or ""),
+        captcha_solver_url=str(captcha.get("solver_url", "") or ""),
+        captcha_api_key=os.getenv("CAPTCHA_API_KEY") or str(captcha.get("api_key", "") or ""),
+        captcha_solve_timeout_sec=int(captcha.get("solve_timeout_sec", 150)),
         selectors=selectors,
         state_file=base_dir / data.get("state_file", "state.json"),
         log_file=base_dir / data.get("log_file", "bot.log"),

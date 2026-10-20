@@ -13,7 +13,7 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from donor_bot.config import Config, Site  # noqa: E402
-from donor_bot.scheduler import launch_browser, new_context, next_window_start  # noqa: E402
+from donor_bot.scheduler import BrowserSession, CONTEXT_ARGS, next_window_start  # noqa: E402
 from donor_bot.site import Result, SiteClient  # noqa: E402
 from tests import fake_site  # noqa: E402
 
@@ -27,7 +27,9 @@ def make_cfg(url: str, tmp_path: Path, **over) -> Config:
         timezone="Europe/Moscow", time="12:00", start_before_sec=45, window_min=1, retry_interval_sec=1,
         donation_type_regex="тромбоцит", date_preference="earliest", preferred_times=[],
         dry_run=False, pause_days_after_success=14,
-        headless=True, slow_mo_ms=0, timeout_ms=5000, channel=None, selectors={},
+        headless=True, slow_mo_ms=0, timeout_ms=5000, channel=None, profile_dir=None,
+        captcha_solver="rucaptcha", captcha_solver_url="", captcha_api_key="", captcha_solve_timeout_sec=30,
+        selectors={},
         state_file=tmp_path / "state.json", log_file=tmp_path / "bot.log",
         telegram_token="", telegram_chat_id="",
     )
@@ -43,12 +45,17 @@ def server():
 
 
 @pytest.fixture(scope="module")
-def browser():
+def pw():
     from playwright.sync_api import sync_playwright
-    with sync_playwright() as pw:
-        b = pw.chromium.launch(headless=True)
-        yield b
-        b.close()
+    with sync_playwright() as p:
+        yield p
+
+
+@pytest.fixture(scope="module")
+def browser(pw):
+    b = pw.chromium.launch(headless=True)
+    yield b
+    b.close()
 
 
 @pytest.fixture(autouse=True)
@@ -57,7 +64,7 @@ def reset(server):
 
 
 def run_attempt(cfg, browser, dump_dir=None):
-    client = SiteClient(cfg, cfg.sites[0], new_context(browser), dump_dir=dump_dir)
+    client = SiteClient(cfg, cfg.sites[0], browser.new_context(**CONTEXT_ARGS), dump_dir=dump_dir)
     try:
         return client.attempt(), client
     finally:
@@ -128,3 +135,45 @@ def test_next_window_start():
     assert next_window_start(cfg, now) == datetime(2026, 10, 20, 11, 59, 15, tzinfo=tz)
     now = datetime(2026, 10, 20, 12, 30, tzinfo=tz)
     assert next_window_start(cfg, now) == datetime(2026, 10, 21, 11, 59, 15, tzinfo=tz)
+
+
+def test_captcha_checkbox_auto_click(server, browser, tmp_path):
+    requests.get(server + "/admin/captcha?v=checkbox", timeout=5)
+    cfg = make_cfg(server, tmp_path)
+    result, client = run_attempt(cfg, browser)
+    assert result == Result.BOOKED, client.last_message
+    assert fake_site.STATE.last_token == "tok-checkbox"
+
+
+def test_captcha_challenge_solved_by_service(server, browser, tmp_path):
+    requests.get(server + "/admin/captcha?v=challenge", timeout=5)
+    cfg = make_cfg(server, tmp_path, captcha_api_key="test-key", captcha_solver_url=server)
+    result, client = run_attempt(cfg, browser)
+    assert result == Result.BOOKED, client.last_message
+    assert fake_site.STATE.last_token == "tok-service"
+    assert fake_site.STATE.solver_calls >= 2
+
+
+def test_captcha_challenge_without_service_fails(server, browser, tmp_path):
+    requests.get(server + "/admin/captcha?v=challenge", timeout=5)
+    cfg = make_cfg(server, tmp_path)
+    result, _ = run_attempt(cfg, browser)
+    assert result == Result.CAPTCHA_FAILED
+    assert fake_site.STATE.booking is None
+
+
+def test_persistent_profile_session(server, pw, tmp_path):
+    """С profile_dir cookies переживают перезапуск браузера: второй запуск уже авторизован."""
+    cfg = make_cfg(server, tmp_path, profile_dir=tmp_path / "profile")
+    session = BrowserSession(pw, cfg)
+    client = SiteClient(cfg, cfg.sites[0], session.new_context())
+    assert client.login()
+    client.close()
+    session.close()
+
+    session = BrowserSession(pw, cfg)
+    client = SiteClient(cfg, cfg.sites[0], session.new_context())
+    client.page.goto(server + "/account/")
+    assert client.is_logged_in()
+    client.close()
+    session.close()
