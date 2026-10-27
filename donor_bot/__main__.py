@@ -1,110 +1,82 @@
-"""Точка входа: python -m donor_bot <команда>."""
+"""python -m donor_bot run | once | check | clear-pause"""
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import sys
-from datetime import datetime
-from pathlib import Path
+import time
 
-from .config import load_config
-from .log import setup_logging
-from .scheduler import next_window_start, run_forever, run_window
-from .state import State
-
-log = logging.getLogger("donor_bot")
+from .bot import clear_pause, run_forever, run_window
+from .captcha import Captcha, CaptchaError
+from .config import Config, load_config
+from .site import Site
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="donor_bot", description="Бот записи на сдачу тромбоцитов")
-    p.add_argument("--config", default="config.yaml", help="путь к config.yaml")
-    p.add_argument("--env", default=".env", help="путь к .env с логином/паролем")
-    p.add_argument("--headful", action="store_true", help="показать окно браузера")
+async def check(cfg: Config) -> None:
+    """Вход, кабинет и токен капчи на каждом сайте — без заявки."""
+    async with Captcha(cfg.headless) as captcha:
+        for conf in cfg.sites:
+            site = Site(conf.name, conf.url, cfg.login, cfg.password)
+            try:
+                await site.login()
+                acc = await site.account(full=True)
+                rows = ", ".join(r.date + ("✓" if r.form else "×" if r.sold_out else "") for r in acc.rows)
+                widget = await captcha.widget(site.url, acc.sitekey, cfg.token_max_age_sec)
+                try:
+                    await widget.refresh()
+                    cap = "чекбокс даёт токен"
+                except CaptchaError as exc:
+                    cap = f"{exc}; {'токены возьмёт rucaptcha' if cfg.captcha_api_key else 'сайт будет пропущен'}"
+                print(f"{site.name}: вход ок; заявка в кабинете: {'есть' if acc.has_booking else 'нет'}; "
+                      f"даты: {rows or '—'}; капча: {cap}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"{site.name}: ошибка: {exc}")
+            finally:
+                await site.close()
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="donor_bot", description="Запись на донацию тромбоцитов")
+    p.add_argument("--config", default="config.yaml")
+    p.add_argument("--env", default=".env")
+    p.add_argument("--site", action="append", help="только эти сайты (name из config)")
+    p.add_argument("--headful", action="store_true", help="показать окно браузера с капчей")
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("run", help="каждый день в open_time ловить слот")
+    once = sub.add_parser("once", help="ловить слот прямо сейчас")
+    once.add_argument("--window", type=float, default=60, help="секунд (по умолчанию 60)")
+    once.add_argument("--dry-run", action="store_true", help="найти слот, но заявку не отправлять")
+    sub.add_parser("check", help="проверить вход и капчу на всех сайтах")
+    sub.add_parser("clear-pause", help="снять паузу после записи")
+    args = p.parse_args()
 
-    run = sub.add_parser("run", help="работать постоянно: каждый день в назначенное время пытаться записаться")
-    run.add_argument("--site", action="append", help="ограничить сайтами (по name из config), можно несколько")
-
-    once = sub.add_parser("once", help="попытаться записаться прямо сейчас")
-    once.add_argument("--window", type=float, default=None, help="минут продолжать попытки (по умолчанию 0.5)")
-    once.add_argument("--dry-run", action="store_true", help="дойти до подтверждения, но не нажимать")
-    once.add_argument("--site", action="append", help="ограничить сайтами (по name из config), можно несколько")
-
-    recon = sub.add_parser("recon", help="разведка: войти, сохранить скриншоты/HTML всех шагов, ничего не подтверждать")
-    recon.add_argument("--site", action="append", help="ограничить сайтами (по name из config)")
-    recon.add_argument("--out", default=None, help="папка для дампов (по умолчанию archive.dir из config)")
-
-    sub.add_parser("login-test", help="проверить вход на все сайты")
-    sub.add_parser("next", help="показать время следующего запуска")
-    sub.add_parser("clear-pause", help="сбросить паузу после успешной записи")
-    return p
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
     cfg = load_config(args.config, args.env)
+    if args.site:
+        cfg.sites = [s for s in cfg.sites if s.name in args.site]
     if args.headful:
         cfg.headless = False
-    setup_logging(cfg.log_file, args.verbose)
-    state = State(cfg.state_file)
-
-    if args.cmd not in ("next", "clear-pause") and not (cfg.login and cfg.password):
-        log.error("Не заданы DONOR_LOGIN / DONOR_PASSWORD (см. .env.example)")
-        return 2
-
-    if args.cmd == "next":
-        print(next_window_start(cfg).strftime("%Y-%m-%d %H:%M:%S %Z"))
-        if state.is_paused(datetime.now().date()):
-            print(f"пауза после записи до {state.paused_until}")
-        return 0
-
-    if args.cmd == "clear-pause":
-        state.clear_pause()
-        print("пауза сброшена")
-        return 0
-
-    if args.cmd == "login-test":
-        from playwright.sync_api import sync_playwright
-        from .scheduler import BrowserSession
-        from .site import SiteClient
-
-        ok_all = True
-        with sync_playwright() as pw:
-            session = BrowserSession(pw, cfg)
-            for site in cfg.sites:
-                client = SiteClient(cfg, site, session.new_context())
-                ok = client.login()
-                print(f"{site.name:12s} {site.url:32s} {'OK' if ok else 'FAIL'}")
-                ok_all &= ok
-                client.close()
-                session.drop_context(client.context)
-            session.close()
-        return 0 if ok_all else 1
-
-    if args.cmd == "recon":
-        cfg.dry_run = True
-        root = Path(args.out) if args.out else cfg.archive_dir
-        result = run_window(cfg, state, window_min=0, mode="recon", sites=args.site, archive_root=root)
-        print(f"\nРезультат разведки: {result.value if result else 'ничего не записано'}")
-        print(f"Скриншоты, HTML, списки элементов и журнал действий: {root.resolve()} (последняя папка *_recon)")
-        return 0
-
-    if args.cmd == "once":
-        if args.dry_run:
-            cfg.dry_run = True
-        window = 0.5 if args.window is None else args.window
-        result = run_window(cfg, state, window_min=window, mode="once", sites=args.site)
-        print(f"Результат: {result.value if result else 'не записались'}")
-        return 0 if result else 1
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
+                        handlers=[logging.StreamHandler(sys.stdout),
+                                  logging.FileHandler(cfg.log_file, encoding="utf-8")])
+    for noisy in ("httpx", "httpcore", "asyncio"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     if args.cmd == "run":
-        if args.site:
-            cfg.sites = [s for s in cfg.sites if s.name in args.site]
-        run_forever(cfg, state)
-        return 0
-    return 1
+        logging.getLogger("donor_bot").info("сайты: %s", ", ".join(s.name for s in cfg.sites))
+        asyncio.run(run_forever(cfg, cfg.sites))
+    elif args.cmd == "once":
+        cfg.dry_run = cfg.dry_run or args.dry_run
+        now = time.time()
+        asyncio.run(run_window(cfg, cfg.sites, now, now + args.window))
+    elif args.cmd == "check":
+        asyncio.run(check(cfg))
+    elif args.cmd == "clear-pause":
+        clear_pause(cfg)
+        print("пауза снята")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

@@ -1,15 +1,14 @@
 .env
 state.json
-bot.log
-recon_out/
-runs/
+*.log
 __pycache__/
 *.pyc
 .venv/
-venv/
 .pytest_cache/
-browser_profile/
+# артефакты старой версии бота (браузерные профили, дампы страниц с данными кабинета)
+browser_profile*/
+runs/
+learned/
+recon_out/
 send.lock
-browser_profile_parallel/
-*.log
 *_stdout.txt
