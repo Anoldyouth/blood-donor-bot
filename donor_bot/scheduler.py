@@ -1,7 +1,9 @@
 """Планировщик: ждёт 12:00 по Москве и в течение окна пытается записаться."""
 from __future__ import annotations
 
+import dataclasses
 import logging
+import threading
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -12,7 +14,8 @@ from playwright.sync_api import sync_playwright
 from .archive import RunArchive
 from .config import Config
 from .notify import notify
-from .site import Result, SiteClient
+from .fast import Sprinter
+from .site import GRAMPUS, Result, SiteClient
 from .state import State
 
 log = logging.getLogger(__name__)
@@ -94,17 +97,23 @@ class BrowserSession:
 
 def run_window(cfg: Config, state: State, window_min: float | None = None,
                mode: str = "run", sites: list[str] | None = None,
-               archive_root: Path | None = None) -> Result | None:
-    """Пытается записаться на сайтах по приоритету, пока не выйдет окно или не будет успеха."""
+               archive_root: Path | None = None, stop: threading.Event | None = None) -> Result | None:
+    """Пытается записаться на сайтах по приоритету, пока не выйдет окно или не будет успеха.
+
+    parallel_sites: каждый сайт — в своём потоке и своём браузере (сессия на сайт одна,
+    но у разных сайтов они независимы). Первый успех останавливает остальные потоки."""
     window_min = cfg.window_min if window_min is None else window_min
     tz = ZoneInfo(cfg.timezone)
     hh, mm = parse_hhmm(cfg.time)
     now = datetime.now(tz)
     open_at = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    if open_at < now - timedelta(minutes=window_min):
+    lead = timedelta(seconds=cfg.start_before_sec + 120)
+    if mode == "recon" or open_at < now - timedelta(minutes=window_min) or open_at > now + lead:
         open_at = now  # запущено вручную вне расписания — отсчёт окна от текущего момента
     deadline = max(open_at, now) + timedelta(minutes=window_min)
     chosen = [s for s in cfg.sites if not sites or s.name in sites]
+    if cfg.parallel_sites and len(chosen) > 1 and stop is None:
+        return _run_parallel(cfg, state, window_min, mode, chosen, archive_root)
 
     final: Result | None = None
     archive = RunArchive(archive_root or cfg.archive_dir, mode, cfg.archive_keep_days)
@@ -126,8 +135,30 @@ def run_window(cfg: Config, state: State, window_min: float | None = None,
                 ok = client_for(site).ensure_logged_in()
                 log.info("[%s] предварительный вход: %s", site.name, "ок" if ok else "НЕ УДАЛСЯ")
 
+            if cfg.fast_mode and mode != "recon" and len(chosen) == 1:
+                client = client_for(chosen[0])
+                if client.page.locator(GRAMPUS["table"]).count():
+                    log.info("[%s] быстрый режим: опрос каждые %.2f с, токен капчи заранее",
+                             chosen[0].name, cfg.poll_interval_sec)
+                    result = Sprinter(client).run(open_at.timestamp(), deadline.timestamp(), stop)
+                    client._finish_attempt(result or Result.NO_BUTTON)
+                    log.info("[%s] итог быстрого режима: %s %s", chosen[0].name,
+                             result.value if result else "окно вышло",
+                             f"— {client.last_message}" if client.last_message else "")
+                    if result in STOP_RESULTS:
+                        if stop is not None:
+                            stop.set()
+                        _on_stop(cfg, state, chosen[0].name, result, client.last_message)
+                        return result
+                    if result is None or datetime.now(tz) >= deadline:
+                        log.info("окно попыток закончилось, записаться не удалось")
+                        return None
+                    # быстрый режим сдался (капча, отказы сайта) — дальше обычные попытки
+
             rounds = 0
             while True:
+                if stop is not None and stop.is_set():
+                    return None
                 now = datetime.now(tz)
                 if now < open_at:
                     wait = min((open_at - now).total_seconds(), 5)
@@ -143,6 +174,8 @@ def run_window(cfg: Config, state: State, window_min: float | None = None,
                              f"— {client.last_message}" if client.last_message else "")
                     if result in STOP_RESULTS:
                         final = result
+                        if stop is not None:
+                            stop.set()
                         _on_stop(cfg, state, site.name, result, client.last_message)
                         return final
                     if result == Result.ERROR:
@@ -159,6 +192,32 @@ def run_window(cfg: Config, state: State, window_min: float | None = None,
                 c.close()
                 session.drop_context(c.context)
             session.close()
+
+
+def _run_parallel(cfg: Config, state: State, window_min: float, mode: str, chosen: list,
+                  archive_root: Path | None) -> Result | None:
+    stop = threading.Event()
+    results: dict[str, Result | None] = {}
+
+    def worker(site) -> None:
+        site_cfg = dataclasses.replace(
+            cfg, sites=[site], profile_dir=(cfg.profile_dir / site.name) if cfg.profile_dir else None)
+        try:
+            results[site.name] = run_window(site_cfg, state, window_min, mode, None, archive_root, stop)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("[%s] поток упал: %s", site.name, exc)
+            results[site.name] = None
+
+    log.info("параллельно по сайтам: %s", ", ".join(s.name for s in chosen))
+    threads = [threading.Thread(target=worker, args=(s,), name=s.name, daemon=True) for s in chosen]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for s in chosen:  # по приоритету
+        if results.get(s.name) in STOP_RESULTS:
+            return results[s.name]
+    return None
 
 
 def _on_stop(cfg: Config, state: State, site_name: str, result: Result, message: str) -> None:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -39,7 +40,67 @@ class Result(str, Enum):
     ERROR = "error"
 
 
+GRAMPUS = {
+    "table": "table.needs-table",
+    "row": "table.needs-table tr.dates-table__item",
+    "date": "td.table-item__date",
+    "free_btn": 'td.table-item__btn [data-src="#modal-reservation"]',
+    "forbidden_btn": 'td.table-item__btn [data-src="#modal-forbidden"]',
+    "time_select": 'select[name="time-reservation"]:visible',
+    "send": ".modal-reservation__wrapper [form-send]:visible",
+    "my_list": "#modal-list-reservation .modal-list-reservation__body",
+    "my_entry": "#modal-list-reservation .modal-list-reservation__body > :not(.not-found), "
+                "#modal-list-reservation .cancel-entry",
+}
+
+# Вход без навигации: окно записи и токен капчи остаются на странице. Сессия на сайтах живёт
+# 30–60 с от входа, а при ошибке отправки сайт сам уводит страницу на ?status=false,
+# поэтому перед «Отправить» входим заново этим запросом (~1 с) и проверяем REST (/wp-json/).
+FAST_LOGIN_JS = """async ([log, pwd, to, verify]) => {
+  const r = await fetch('/auth.php', {method: 'POST', credentials: 'include', redirect: 'manual',
+                                      body: new URLSearchParams({log, pwd, redirect_to: to})});
+  if (!verify) return r.type === 'opaqueredirect' ? 200 : r.status;
+  return (await fetch('/wp-json/', {credentials: 'include'})).status;
+}"""
+
+SEND_LOCK_TTL_SEC = 30 * 60
+
+
+def _send_lock_path(cfg: Config) -> Path:
+    return Path(cfg.state_file).parent / "send.lock"
+
+
+def acquire_send_lock(cfg: Config, owner: str) -> str | None:
+    """Одна заявка на все процессы: второй отправитель заблокировал бы аккаунт.
+
+    None — блокировка взята; иначе строка о том, кто её держит."""
+    path = _send_lock_path(cfg)
+    for _ in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                if time.time() - path.stat().st_mtime > SEND_LOCK_TTL_SEC:
+                    path.unlink()
+                    continue
+                return path.read_text(encoding="utf-8").strip() or "?"
+            except OSError:
+                return "?"
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(f"pid {os.getpid()} {datetime.now():%H:%M:%S} {owner}")
+        return None
+    return "?"
+
+
+def release_send_lock(cfg: Config) -> None:
+    try:
+        _send_lock_path(cfg).unlink()
+    except OSError:
+        pass
+
+
 RX = {
+    "grampus_error": re.compile(r"ошибк|не удалось|отклон|заблокир|недоступн|попробуйте", re.I),
     "login_link": re.compile(r"\bвход\b|войти|личный кабинет|авториз|login|sign ?in", re.I),
     "login_submit": re.compile(r"войти|\bвход\b|авториз|login|sign ?in", re.I),
     "logged_in": re.compile(r"выход|выйти|logout", re.I),
@@ -206,6 +267,53 @@ class SiteClient:
         self.last_message = ""
         self.captcha = CaptchaSolver(cfg, site.name)
         self.login_failed_reason = Result.LOGIN_FAILED
+        self.logged_in_at = 0.0  # time.time() последнего входа; 0 — неизвестно
+        self.picked_time: str | None = None
+        if self.dump_dir:
+            self.page.on("request", self._log_request)
+            self.page.on("response", self._log_response)
+
+    # ---------------------------------------------------- журнал AJAX-запросов
+    NET_RX = re.compile(r"admin-ajax|wp-json|form-v2|reserv|booking", re.I)
+
+    def _net_write(self, entry: dict) -> None:
+        entry["at"] = datetime.now().isoformat(timespec="milliseconds")
+        with open(self.dump_dir / "network.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    SECRET_RX = re.compile(r"((?:pwd|pass\w*|user_password\w*)=)[^&\s]*", re.I)
+
+    def _net_wanted(self, req) -> bool:
+        if req.resource_type not in ("xhr", "fetch", "document"):
+            return False
+        return req.method != "GET" or req.resource_type != "document" and bool(self.NET_RX.search(req.url))
+
+    def _log_request(self, req) -> None:
+        if not self._net_wanted(req):
+            return
+        try:
+            post = req.post_data
+            if post and self.cfg.password:
+                post = self.SECRET_RX.sub(r"\1***", post).replace(self.cfg.password, "***")
+            self._net_write({"dir": "req", "method": req.method, "url": req.url,
+                             "headers": {k: v for k, v in req.headers.items() if k.lower() != "cookie"},
+                             "post": post})
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _log_response(self, resp) -> None:
+        req = resp.request
+        if not self._net_wanted(req):
+            return
+        try:
+            body = resp.text()[:20000]
+        except Exception:  # noqa: BLE001
+            body = None
+        try:
+            self._net_write({"dir": "resp", "method": req.method, "url": resp.url, "status": resp.status,
+                             "body": body})
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------ utils
     @property
@@ -434,7 +542,25 @@ class SiteClient:
                       f" (на странице: «{text[max(0, m.start()-40):m.end()+60].strip()}»)" if m else "")
             return False
         log.info("[%s] вход выполнен", self.site.name)
+        self.logged_in_at = time.time()
         return True
+
+    def fast_relogin(self, verify: bool = True) -> bool:
+        """Вход запросом из текущей страницы, без перехода. True — REST сайта снова отвечает 200.
+
+        verify=False — без проверки REST (−0,6 с): прямо перед отправкой, 401 всё равно поймаем."""
+        t = time.time()
+        try:
+            status = self.page.evaluate(FAST_LOGIN_JS, [self.cfg.login, self.cfg.password, self.account_url, verify])
+        except PWError as exc:
+            log.warning("[%s] быстрый вход: ошибка %s", self.site.name, str(exc).splitlines()[0])
+            return False
+        ok = status == 200
+        log.info("[%s] быстрый вход за %.1f с: %s", self.site.name, time.time() - t,
+                 "ок" if ok else f"REST ответил {status}")
+        if ok:
+            self.logged_in_at = time.time()
+        return ok
 
     def ensure_logged_in(self) -> bool:
         try:
@@ -450,6 +576,8 @@ class SiteClient:
 
     # ---------------------------------------------------------------- booking
     def has_active_booking(self) -> bool:
+        if self.password_visible():
+            return False  # форма входа: в правилах есть «отменить запись» — это не запись
         l = self.custom("has_booking")
         if l is not None:
             return True
@@ -576,7 +704,20 @@ class SiteClient:
             return self.login_failed_reason
         self.page.goto(self.account_url, wait_until="domcontentloaded")
         self._settle()
+        if self.password_visible():
+            log.info("[%s] сессия слетела — вхожу заново", self.site.name)
+            if self.fast_relogin():
+                self.page.goto(self.account_url, wait_until="domcontentloaded")
+                self._settle()
+            if self.password_visible():
+                if not self.login():
+                    return self.login_failed_reason
+                self.page.goto(self.account_url, wait_until="domcontentloaded")
+                self._settle()
         self.dump("account")
+
+        if self.page.locator(GRAMPUS["table"]).count():
+            return self._attempt_grampus()
 
         if self.has_active_booking():
             self.last_message = _snippet(self.body_text(), RX["has_booking"])
@@ -591,6 +732,220 @@ class SiteClient:
 
         self.click(buttons[0], "кнопка записи", role="book_button")
         return self._walk_form()
+
+    # ------------------------------------------- движок «Сервис записи» (grampus)
+    def _attempt_grampus(self) -> Result:
+        """Сайты Центра крови: таблица «Мастер записи» → модалка с <select> времени → «Отправить».
+
+        Разметка (donor-mos*.online):
+          tr.dates-table__item > td.table-item__date «22/10/2026» + td.table-item__btn
+          кнопка свободной даты: button[data-src="#modal-reservation"][data-select="<select name=time-reservation>…"]
+          мест нет: button[data-src="#modal-forbidden"]; дата не для записи: «-»
+          заявки: #modal-list-reservation (.not-found — записей нет, .cancel-entry — есть)
+          успех: редирект на ?message=Вы успешно отправили заявку…&status=true
+        """
+        g = GRAMPUS
+        if self.page.locator(g["my_entry"]).count():
+            self.last_message = " ".join(self.page.locator(g["my_list"]).first.inner_text().split())[:200]
+            log.info("[%s] в кабинете уже есть заявка: %s", self.site.name, self.last_message)
+            return Result.ALREADY_BOOKED
+
+        rows = self.page.locator(g["row"])
+        slots: list[tuple[str, object]] = []
+        forbidden = 0
+        for i in range(rows.count()):
+            row = rows.nth(i)
+            day = row.locator(g["date"]).first.inner_text().strip()
+            if row.locator(g["free_btn"]).count():
+                slots.append((day, row.locator(g["free_btn"]).first))
+            elif row.locator(g["forbidden_btn"]).count():
+                forbidden += 1
+        if not slots:
+            log.info("[%s] свободных дат нет (дат в таблице: %d, «места закончились»: %d)",
+                     self.site.name, rows.count(), forbidden)
+            return Result.NO_BUTTON
+
+        def day_key(item):
+            d, m, y = (item[0].split("/") + ["0", "0", "0"])[:3]
+            return (int(y or 0), int(m or 0), int(d or 0))
+        slots.sort(key=day_key)
+        day, _ = slots[-1] if self.cfg.date_preference == "latest" else slots[0]
+        log.info("[%s] свободные даты: %s → беру %s", self.site.name, ", ".join(s[0] for s in slots), day)
+        if self.dump_dir:
+            for d, b in slots:
+                raw = b.get_attribute("data-select") or ""
+                (self.dump_dir / f"slot_{d.replace('/', '-')}.html").write_text(
+                    b.evaluate("e => e.outerHTML") + "\n\n<!-- data-select -->\n" + raw, encoding="utf-8")
+        failed = self._grampus_fill(day)
+        if failed:
+            return failed
+        self.dump("form_filled")
+
+        if not self.pass_captcha():
+            return Result.CAPTCHA_FAILED
+        if self.cfg.dry_run:
+            log.info("[%s] DRY RUN: «Отправить» не нажимаю (%s)", self.site.name, self.last_message)
+            return Result.DRY_RUN
+        token = self.captcha.detect(self.page)["token"]
+
+        holder = self._wait_send_lock()
+        if holder:
+            log.warning("[%s] заявку уже отправляет другой процесс (%s) — не отправляю вторую",
+                        self.site.name, holder)
+            self.last_message = f"параллельная отправка: {holder}"
+            return Result.NO_BUTTON
+        result = Result.STUCK
+        try:
+            # Сессия живёт 30–60 с от входа и активностью не продлевается, а капча с заданием
+            # решается 30–60 с: перед отправкой входим заново запросом, не трогая открытое окно.
+            # Если так не вышло — полный вход, форма заново, токен капчи переносим в неё.
+            age = time.time() - self.logged_in_at
+            if age > self.cfg.session_ttl_sec and not self.fast_relogin():
+                log.info("[%s] сессии %.0f с — полный перелогин перед отправкой", self.site.name, age)
+                failed = self._grampus_relogin(day, token)
+                if failed:
+                    result = failed
+                    return result
+            status = self._grampus_send()
+            if status == 401:
+                log.warning("[%s] сайт ответил 401 (сессия слетела) — перелогин и повторная отправка",
+                            self.site.name)
+                failed = self._grampus_relogin(day, token)
+                if failed:
+                    result = failed
+                    return result
+                status = self._grampus_send()
+            result = self._grampus_result(status)
+            return result
+        finally:
+            if result != Result.BOOKED:
+                release_send_lock(self.cfg)
+
+    def _grampus_fill(self, day: str) -> Result | None:
+        """Открывает окно записи на дату day и выбирает время. None — форма заполнена."""
+        g = GRAMPUS
+        btn = None
+        rows = self.page.locator(g["row"])
+        for i in range(rows.count()):
+            row = rows.nth(i)
+            if row.locator(g["date"]).first.inner_text().strip() == day:
+                btn = row.locator(g["free_btn"]).first
+                break
+        if btn is None or not btn.count():
+            self.last_message = f"{day}: мест уже нет"
+            log.info("[%s] %s", self.site.name, self.last_message)
+            return Result.NO_SLOTS
+        self.record("date", None, g["free_btn"], "grampus")
+        btn.click()
+
+        select = self.page.locator(g["time_select"])
+        try:
+            select.first.wait_for(state="visible", timeout=10000)
+        except PWError:
+            self.dump("no_time_select")
+            self.last_message = f"{day}: окно выбора времени не появилось"
+            return Result.STUCK
+        options = [o for o in select.first.evaluate(
+            "s => [...s.options].map(o => ({value: o.value, text: o.text.trim(), disabled: o.disabled}))")
+            if o["value"] and not o["disabled"]]
+        if not options:
+            self.dump("no_times")
+            self.last_message = f"{day}: нет свободного времени"
+            return Result.NO_SLOTS
+        pick = options[0]
+        # при повторном заполнении держимся уже выбранного времени
+        for pref in ([self.picked_time] if self.picked_time else []) + self.cfg.preferred_times:
+            hit = next((o for o in options if o["text"].startswith(pref) or o["value"].startswith(pref)), None)
+            if hit:
+                pick = hit
+                break
+        select.first.select_option(pick["value"])
+        self.record("time", None, g["time_select"], "grampus")
+        log.info("[%s] %s: время %s (из %s)", self.site.name, day, pick["text"],
+                 ", ".join(o["text"] for o in options))
+        self.picked_time = pick["value"]
+        self.last_message = f"{day} {pick['text']}"
+        return None
+
+    def _grampus_relogin(self, day: str, token: str) -> Result | None:
+        """Новый вход, заново дата/время и уже полученный токен капчи.
+
+        Сначала быстрый вход запросом; не вышло — cookie сайта удаляются и вход через форму."""
+        if not self.fast_relogin():
+            host = re.sub(r"^https?://", "", self.site.base).split("/")[0].split(":")[0]
+            self.context.clear_cookies(domain=host)
+            if not self.login():
+                return self.login_failed_reason
+        self.page.goto(self.account_url, wait_until="domcontentloaded")
+        self._settle()
+        failed = self._grampus_fill(day)
+        if failed:
+            return failed
+        if token:
+            if not self.captcha.inject_token(self.page, token):
+                return Result.CAPTCHA_FAILED
+        elif not self.pass_captcha():
+            return Result.CAPTCHA_FAILED
+        self.dump("form_refilled")
+        return None
+
+    def _grampus_send(self) -> int | None:
+        """Жмёт «Отправить»; HTTP-статус /form-v2/send или None, если запроса не было."""
+        g = GRAMPUS
+        try:
+            with self.page.expect_response(lambda r: "form-v2/send" in r.url, timeout=30000) as info:
+                self.page.locator(g["send"]).first.click()
+                self.record("final_confirm", None, g["send"], "grampus")
+            status = info.value.status
+        except PWError:
+            return None
+        log.info("[%s] ответ на отправку: %s", self.site.name, status)
+        return status
+
+    def _grampus_result(self, status: int | None) -> Result:
+        if status is not None and status >= 400:
+            self.dump("after_send")
+            self.last_message = f"{self.last_message}: сайт ответил {status}"
+            log.warning("[%s] %s", self.site.name, self.last_message)
+            return self._grampus_verify()
+        try:
+            self.page.wait_for_url(re.compile(r"[?&]status="), timeout=15000)
+        except PWError:
+            self.dump("after_send")
+            return self._grampus_verify()
+        self._settle()
+        self.dump("after_send")
+        m = re.search(r"[?&]status=(\w+)", self.page.url)
+        text = " ".join(self.body_text().split())
+        if m and m.group(1) == "true":
+            self.last_message = f"{self.last_message}. Заявка отправлена, ждёт подтверждения врача"
+            return Result.BOOKED
+        self.last_message = (f"{self.last_message}: сайт отклонил заявку — "
+                             f"{_snippet(text, RX['grampus_error'])}")
+        log.warning("[%s] %s", self.site.name, self.last_message)
+        return Result.ERROR
+
+    def _wait_send_lock(self) -> str | None:
+        """Берёт send.lock; если его держит другой сайт — ждёт: его отправка могла не пройти."""
+        owner = f"{self.site.name} {self.last_message}"
+        end = time.time() + self.cfg.send_lock_wait_sec
+        holder = acquire_send_lock(self.cfg, owner)
+        if holder:
+            log.info("[%s] send.lock занят (%s) — жду до %.0f с", self.site.name, holder,
+                     self.cfg.send_lock_wait_sec)
+        while holder and time.time() < end:
+            time.sleep(1)
+            holder = acquire_send_lock(self.cfg, owner)
+        return holder
+
+    def _grampus_verify(self) -> Result:
+        """Редиректа не было: проверяем «Список моих записей»."""
+        self.page.goto(self.account_url, wait_until="domcontentloaded")
+        self._settle()
+        self.dump("verify")
+        if self.page.locator(GRAMPUS["my_entry"]).count():
+            return Result.BOOKED
+        return Result.STUCK
 
     def _walk_form(self, max_steps: int = 10) -> Result:
         """Проходит форму записи шаг за шагом, пока не увидит подтверждение."""
@@ -733,6 +1088,9 @@ class SiteClient:
         except PWError:
             return Result.STUCK
         self.dump("verify")
+        if self.password_visible():
+            # Выкинуло на форму входа: текст правил там упоминает «отменить запись» — это не запись
+            return Result.STUCK
         if self.has_active_booking():
             self.last_message = _snippet(self.body_text(), RX["has_booking"])
             log.info("[%s] в кабинете появилась запись: %s", self.site.name, self.last_message)

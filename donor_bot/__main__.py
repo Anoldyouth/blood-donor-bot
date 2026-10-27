@@ -23,7 +23,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("run", help="работать постоянно: каждый день в назначенное время пытаться записаться")
+    run = sub.add_parser("run", help="работать постоянно: каждый день в назначенное время пытаться записаться")
+    run.add_argument("--site", action="append", help="ограничить сайтами (по name из config), можно несколько")
 
     once = sub.add_parser("once", help="попытаться записаться прямо сейчас")
     once.add_argument("--window", type=float, default=None, help="минут продолжать попытки (по умолчанию 0.5)")
@@ -98,6 +99,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result else 1
 
     if args.cmd == "run":
+        if args.site:
+            cfg.sites = [s for s in cfg.sites if s.name in args.site]
         run_forever(cfg, state)
         return 0
     return 1

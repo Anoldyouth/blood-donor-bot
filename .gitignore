@@ -9,3 +9,7 @@ __pycache__/
 venv/
 .pytest_cache/
 browser_profile/
+send.lock
+browser_profile_parallel/
+*.log
+*_stdout.txt

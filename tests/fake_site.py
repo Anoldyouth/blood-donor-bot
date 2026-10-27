@@ -58,7 +58,7 @@ class Handler(BaseHTTPRequestHandler):
         mode = "1" if STATE.captcha == "checkbox" else "2"
         return f"""
             <div class="smart-captcha" data-sitekey="ysc1_fake_sitekey">
-              <iframe src="/captcha/checkbox?m={mode}" width="300" height="60"></iframe>
+              <iframe src="/captcha/checkbox?m={mode}&hideChallengeContainer=false" width="300" height="60"></iframe>
             </div>
             <input type="hidden" name="smart-token" value="">
             <script>

@@ -16,6 +16,8 @@ import logging
 import time
 from enum import Enum
 
+from concurrent.futures import ThreadPoolExecutor
+
 import requests
 from playwright.sync_api import Error as PWError, Page
 
@@ -32,6 +34,9 @@ SOLVER_URLS = {
     "rucaptcha": "https://rucaptcha.com",
     "2captcha": "https://2captcha.com",
 }
+
+
+_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="captcha")
 
 
 class CaptchaStatus(str, Enum):
@@ -52,7 +57,9 @@ DETECT_JS = r"""
   for (const c of containers) { sitekey = c.getAttribute('data-sitekey') || sitekey; }
   for (const f of frames) { const m = /sitekey=([^&]+)/.exec(f.getAttribute('src') || ''); if (m) sitekey = sitekey || decodeURIComponent(m[1]); }
   const token = tokens.map(t => t.value || '').find(v => v.length > 0) || '';
-  const challenge = frames.some(f => vis(f) && /advanced|challenge/i.test(f.getAttribute('src') || '')) ||
+  // только путь: в query у обычного чекбокса есть hideChallengeContainer=false
+  const path = (s) => (s || '').split('?')[0];
+  const challenge = frames.some(f => vis(f) && /advanced|challenge/i.test(path(f.getAttribute('src')))) ||
                     q('[class*="AdvancedCaptcha"], [class*="advanced-captcha"]').some(vis);
   const present = frames.some(vis) || containers.some(vis) || challenge;
   return {present, frames: frames.map(f => f.getAttribute('src') || ''), sitekey, token, challenge,
@@ -87,17 +94,26 @@ class CaptchaSolver:
         log.info("[%s] обнаружена капча (sitekey=%s, challenge=%s)", self.site_name,
                  info["sitekey"] or "?", info["challenge"])
 
+        # Сервис (живые люди, 20–60 с) запускаем сразу, параллельно с чекбоксом: если чекбокс
+        # откроет задание, время уже идёт. Лишняя задача стоит ~1 ₽, опоздание — запись.
+        future = None
+        if self.cfg.captcha_api_key and info["sitekey"]:
+            future = _POOL.submit(self._solve_via_service, page.url, info["sitekey"])
+
         if not info["challenge"] and self._click_checkbox(page):
-            if self._wait_token(page, timeout=12):
+            if self._wait_token(page, timeout=12, future=future):
                 log.info("[%s] капча пройдена по чекбоксу", self.site_name)
                 return CaptchaStatus.SOLVED
             info = self.detect(page)
             if not info["present"]:
                 return CaptchaStatus.SOLVED
 
-        if self.cfg.captcha_api_key:
-            token = self._solve_via_service(page, info["sitekey"])
-            if token and self._inject_token(page, token):
+        if future is not None:
+            try:
+                token = future.result(timeout=self.cfg.captcha_solve_timeout_sec + 35)
+            except Exception:  # noqa: BLE001
+                token = None
+            if token and self.inject_token(page, token):
                 log.info("[%s] капча решена сервисом %s", self.site_name, self.cfg.captcha_solver)
                 return CaptchaStatus.SOLVED
             return CaptchaStatus.FAILED
@@ -111,7 +127,7 @@ class CaptchaSolver:
         for frame in page.frames:
             if not any(h in frame.url for h in CAPTCHA_HOSTS) and "captcha" not in frame.url.lower():
                 continue
-            if any(h in frame.url.lower() for h in ("advanced", "challenge")):
+            if any(h in frame.url.split("?")[0].lower() for h in ("advanced", "challenge")):
                 continue
             try:
                 box = frame.locator(CHECKBOX_CSS).first
@@ -123,18 +139,19 @@ class CaptchaSolver:
                 log.debug("checkbox click failed: %s", exc)
         return False
 
-    def _wait_token(self, page: Page, timeout: float) -> bool:
+    def _wait_token(self, page: Page, timeout: float, future=None) -> bool:
         end = time.time() + timeout
         while time.time() < end:
             info = self.detect(page)
             if info["token"]:
                 return True
-            if info["challenge"]:
+            if info["challenge"] or (future is not None and future.done() and not future.exception()
+                                     and future.result()):
                 return False
-            time.sleep(0.5)
+            time.sleep(0.3)
         return False
 
-    def _inject_token(self, page: Page, token: str) -> bool:
+    def inject_token(self, page: Page, token: str) -> bool:
         try:
             n = page.evaluate(
                 """([css, token]) => { const els = Array.from(document.querySelectorAll(css));
@@ -148,7 +165,8 @@ class CaptchaSolver:
             return False
         return True
 
-    def _solve_via_service(self, page: Page, sitekey: str) -> str | None:
+    def _solve_via_service(self, pageurl: str, sitekey: str) -> str | None:
+        """Работает в отдельном потоке — к странице Playwright отсюда не обращаться."""
         if not sitekey:
             log.warning("[%s] не удалось определить sitekey капчи — сервис распознавания недоступен", self.site_name)
             return None
@@ -159,7 +177,7 @@ class CaptchaSolver:
         try:
             r = requests.post(f"{base}/in.php", data={
                 "key": self.cfg.captcha_api_key, "method": "yandex",
-                "sitekey": sitekey, "pageurl": page.url, "json": 1}, timeout=30).json()
+                "sitekey": sitekey, "pageurl": pageurl, "json": 1}, timeout=30).json()
         except Exception as exc:  # noqa: BLE001
             log.warning("[%s] сервис капчи недоступен: %s", self.site_name, exc)
             return None
@@ -171,7 +189,7 @@ class CaptchaSolver:
                  self.site_name, task_id, self.cfg.captcha_solve_timeout_sec)
         end = time.time() + self.cfg.captcha_solve_timeout_sec
         while time.time() < end:
-            time.sleep(5)
+            time.sleep(3)
             try:
                 res = requests.get(f"{base}/res.php", params={
                     "key": self.cfg.captcha_api_key, "action": "get", "id": task_id, "json": 1}, timeout=30).json()

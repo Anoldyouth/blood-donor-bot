@@ -54,6 +54,18 @@ class Config:
     telegram_token: str
     telegram_chat_id: str
     raw: dict[str, Any] = field(default_factory=dict)
+    parallel_sites: bool = False
+    session_ttl_sec: float = 20        # сессия живёт 30–60 с от входа (не меньше 27 с); старше — вход перед «Отправить»
+    send_lock_wait_sec: float = 60     # сколько ждать, пока другой сайт закончит отправку
+    # быстрый режим (donor_bot/fast.py) для сайтов «Сервис записи»
+    fast_mode: bool = True
+    poll_interval_sec: float = 0.35    # частый опрос: новый запрос кабинета каждые столько секунд
+    poll_parallel: int = 3             # …и до стольких одновременно (сервер отвечает ~1,5 с)
+    fast_poll_before_sec: float = 40   # раньше — раз в 2 с (23.10 Царицыно открылось в 11:59:52)
+    session_refresh_sec: float = 15    # быстрый вход заранее, чтобы к отправке сессия была свежей
+    captcha_token_max_age_sec: float = 60   # старше — получить новый токен капчи
+    captcha_prefetch_after_sec: float = 300  # держать токен наготове до time + столько секунд
+    max_failed_sends: int = 3          # заявок, отклонённых сайтом, за окно — дальше не пытаться
 
     def account_url(self, site: Site) -> str:
         return site.base + self.account_path
@@ -98,6 +110,17 @@ def load_config(path: str | Path = "config.yaml", env_path: str | Path = ".env")
         start_before_sec=int(sched.get("start_before_sec", 45)),
         window_min=float(sched.get("window_min", 20)),
         retry_interval_sec=float(sched.get("retry_interval_sec", 4)),
+        parallel_sites=bool(sched.get("parallel_sites", False)),
+        session_ttl_sec=float(sched.get("session_ttl_sec", 20)),
+        send_lock_wait_sec=float(booking.get("send_lock_wait_sec", 60)),
+        fast_mode=bool(sched.get("fast_mode", True)),
+        poll_interval_sec=float(sched.get("poll_interval_sec", 0.35)),
+        poll_parallel=int(sched.get("poll_parallel", 3)),
+        fast_poll_before_sec=float(sched.get("fast_poll_before_sec", 40)),
+        session_refresh_sec=float(sched.get("session_refresh_sec", 15)),
+        captcha_token_max_age_sec=float(captcha.get("token_max_age_sec", 60)),
+        captcha_prefetch_after_sec=float(captcha.get("prefetch_after_sec", 300)),
+        max_failed_sends=int(booking.get("max_failed_sends", 3)),
         donation_type_regex=booking.get("donation_type_regex", "тромбоцит"),
         date_preference=booking.get("date_preference", "earliest"),
         preferred_times=[str(t) for t in booking.get("preferred_times", []) or []],

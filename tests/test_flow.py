@@ -222,3 +222,12 @@ def test_persistent_profile_session(server, pw, tmp_path):
     assert client.is_logged_in()
     client.close()
     session.close()
+
+
+def test_captcha_checkbox_preferred_over_service(server, browser, tmp_path):
+    """22.10: «hideChallengeContainer» в адресе чекбокса принимали за задание и ждали rucaptcha ~50 с."""
+    requests.get(server + "/admin/captcha?v=checkbox", timeout=5)
+    cfg = make_cfg(server, tmp_path, captcha_api_key="test-key", captcha_solver_url=server)
+    result, client = run_attempt(cfg, browser)
+    assert result == Result.BOOKED, client.last_message
+    assert fake_site.STATE.last_token == "tok-checkbox"
