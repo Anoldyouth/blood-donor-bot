@@ -30,9 +30,7 @@ class Config:
     priority_wait_sec: float = 2       # сколько сайт пониже ждёт ответа сайтов повыше, найдя слот
     preferred_times: list[str] = field(default_factory=list)
     dry_run: bool = False
-    pause_days: int = 14
     headless: bool = True
-    state_file: Path = Path("state.json")
     log_file: Path = Path("bot.log")
     captcha_api_key: str = ""          # rucaptcha — для сайтов, где вместо галочки задание
     telegram_token: str = ""
@@ -43,7 +41,7 @@ def load_config(path: str = "config.yaml", env: str = ".env") -> Config:
     load_dotenv(env)
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     sites = [SiteConf(**s) for s in raw.pop("sites")]
-    for key in ("state_file", "log_file"):
+    for key in ("log_file",):
         if key in raw:
             raw[key] = Path(raw[key])
     try:

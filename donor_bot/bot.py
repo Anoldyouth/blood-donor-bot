@@ -2,7 +2,7 @@
 
 Отклонённая врачом заявка блокирует аккаунт на 5+ часов, а записи на близкие даты в разных
 отделениях не подтверждаются, поэтому после первой принятой заявки остальные сайты
-останавливаются, а бот встаёт на паузу.
+останавливаются, а бот завершается.
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from enum import Enum
 from zoneinfo import ZoneInfo
 
@@ -257,35 +257,6 @@ class Window:
 
 # ------------------------------------------------------------------ расписание
 
-def load_state(cfg: Config) -> dict:
-    try:
-        return json.loads(cfg.state_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-
-
-def paused_until(cfg: Config) -> date | None:
-    raw = load_state(cfg).get("paused_until")
-    return date.fromisoformat(raw) if raw else None
-
-
-def save_state(cfg: Config, state: dict) -> None:
-    cfg.state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def save_success(cfg: Config, booking: str) -> date:
-    until = datetime.now(MSK).date() + timedelta(days=cfg.pause_days)
-    save_state(cfg, {"last_success": {"booking": booking, "at": datetime.now(MSK).isoformat(timespec="seconds")},
-                     "paused_until": until.isoformat()})
-    return until
-
-
-def clear_pause(cfg: Config) -> None:
-    state = load_state(cfg)
-    state.pop("paused_until", None)
-    save_state(cfg, state)
-
-
 async def notify(cfg: Config, text: str) -> None:
     log.info("NOTIFY: %s", text)
     if not (cfg.telegram_token and cfg.telegram_chat_id):
@@ -301,12 +272,9 @@ async def notify(cfg: Config, text: str) -> None:
 async def run_window(cfg: Config, sites: list[SiteConf], open_at: float, deadline: float) -> Outcome:
     outcome, booking = await Window(cfg, open_at, deadline).run(sites)
     if outcome == Outcome.BOOKED:
-        until = save_success(cfg, booking)
-        await notify(cfg, f"Записался: {booking}. Заявка ждёт подтверждения врача. Пауза до {until:%d.%m}.")
+        await notify(cfg, f"Записался: {booking}. Заявка ждёт подтверждения врача.")
     elif outcome == Outcome.UNCERTAIN:
-        until = save_success(cfg, booking + " (не подтверждено)")
-        await notify(cfg, f"Заявка {booking} могла уйти, но проверить не вышло — посмотрите кабинет. "
-                          f"Пауза до {until:%d.%m} (снять: python -m donor_bot clear-pause).")
+        await notify(cfg, f"Заявка {booking} могла уйти, но проверить не вышло — посмотрите кабинет.")
     elif outcome == Outcome.DRY_RUN:
         log.info("DRY RUN: дошёл бы до заявки %s", booking)
     else:
@@ -322,19 +290,12 @@ def next_open(cfg: Config, now: datetime) -> datetime:
     return at
 
 
-async def run_forever(cfg: Config, sites: list[SiteConf]) -> None:
-    while True:
-        open_at = next_open(cfg, datetime.now(MSK))
-        until = paused_until(cfg)
-        if until and open_at.date() <= until:
-            log.info("пауза после записи до %s", until)
-            open_at = next_open(cfg, datetime.combine(until + timedelta(days=1), datetime.min.time(), MSK))
-        start = open_at.timestamp() - cfg.start_before_sec
-        log.info("следующее окно: %s MSK (вход в %s)", f"{open_at:%d.%m %H:%M}",
-                 datetime.fromtimestamp(start, MSK).strftime("%H:%M:%S"))
-        while (left := start - time.time()) > 0:   # кусками: компьютер мог уснуть
-            await asyncio.sleep(min(left, 60))
-        if paused_until(cfg) and open_at.date() <= paused_until(cfg):
-            continue
-        await run_window(cfg, sites, open_at.timestamp(), open_at.timestamp() + cfg.window_sec)
-        await asyncio.sleep(max(0.0, open_at.timestamp() + cfg.window_sec - time.time()) + 1)
+async def run_next(cfg: Config, sites: list[SiteConf]) -> Outcome:
+    """Дождаться ближайшего open_time, отловить одно окно и закончить."""
+    open_at = next_open(cfg, datetime.now(MSK))
+    start = open_at.timestamp() - cfg.start_before_sec
+    log.info("окно: %s MSK (вход в %s)", f"{open_at:%d.%m %H:%M}",
+             datetime.fromtimestamp(start, MSK).strftime("%H:%M:%S"))
+    while (left := start - time.time()) > 0:   # кусками: компьютер мог уснуть
+        await asyncio.sleep(min(left, 60))
+    return await run_window(cfg, sites, open_at.timestamp(), open_at.timestamp() + cfg.window_sec)

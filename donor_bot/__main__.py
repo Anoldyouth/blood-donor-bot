@@ -1,4 +1,4 @@
-"""python -m donor_bot run | once | check | clear-pause"""
+"""python -m donor_bot run | once | check"""
 from __future__ import annotations
 
 import argparse
@@ -7,7 +7,7 @@ import logging
 import sys
 import time
 
-from .bot import clear_pause, run_forever, run_window
+from .bot import run_next, run_window
 from .captcha import Captcha, CaptchaError
 from .config import Config, load_config
 from .site import Site
@@ -37,6 +37,7 @@ async def check(cfg: Config) -> None:
 
 
 def main() -> None:
+    sys.stdout.reconfigure(encoding="utf-8")   # консоль Windows не печатает «×»
     p = argparse.ArgumentParser(prog="donor_bot", description="Запись на донацию тромбоцитов")
     p.add_argument("--config", default="config.yaml")
     p.add_argument("--env", default=".env")
@@ -44,12 +45,11 @@ def main() -> None:
     p.add_argument("--headful", action="store_true", help="показать окно браузера с капчей")
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("run", help="каждый день в open_time ловить слот")
+    sub.add_parser("run", help="дождаться ближайшего open_time, ловить слот и выйти")
     once = sub.add_parser("once", help="ловить слот прямо сейчас")
     once.add_argument("--window", type=float, default=60, help="секунд (по умолчанию 60)")
     once.add_argument("--dry-run", action="store_true", help="найти слот, но заявку не отправлять")
     sub.add_parser("check", help="проверить вход и капчу на всех сайтах")
-    sub.add_parser("clear-pause", help="снять паузу после записи")
     args = p.parse_args()
 
     cfg = load_config(args.config, args.env)
@@ -66,16 +66,13 @@ def main() -> None:
 
     if args.cmd == "run":
         logging.getLogger("donor_bot").info("сайты: %s", ", ".join(s.name for s in cfg.sites))
-        asyncio.run(run_forever(cfg, cfg.sites))
+        asyncio.run(run_next(cfg, cfg.sites))
     elif args.cmd == "once":
         cfg.dry_run = cfg.dry_run or args.dry_run
         now = time.time()
         asyncio.run(run_window(cfg, cfg.sites, now, now + args.window))
     elif args.cmd == "check":
         asyncio.run(check(cfg))
-    elif args.cmd == "clear-pause":
-        clear_pause(cfg)
-        print("пауза снята")
 
 
 if __name__ == "__main__":
